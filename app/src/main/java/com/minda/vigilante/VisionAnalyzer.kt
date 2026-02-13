@@ -4,11 +4,6 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import kotlin.math.roundToInt
 
-data class Detection(
-    val obstacle: Boolean,
-    val fault: Boolean
-)
-
 class VisionAnalyzer(
     private val roisProvider: () -> List<Roi>,
     private val onDetections: (Map<Int, Detection>) -> Unit
