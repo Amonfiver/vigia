@@ -14,8 +14,12 @@ class VigiaVisionAnalyzer(
     private val getRois: () -> List<Roi>,
     private val onStatusText: (String) -> Unit,
     private val telegram: TelegramClient? = null,
-    private val faultConfirmMs: Long = 15_000L
+    private val faultConfirmMs: Long = 15_000L,
+    private val trainingStore: TrainingStore? = null
 ) : ImageAnalysis.Analyzer {
+
+    // Lo último que “ve” por ROI (para capturar con el botón entrenamiento)
+    val lastFeatures: ConcurrentHashMap<String, Features> = ConcurrentHashMap()
 
     private enum class State { OK, ORANGE, RED_PENDING, RED_CONFIRMED }
 
@@ -63,51 +67,60 @@ class VigiaVisionAnalyzer(
                     grid = 7
                 ) { r, g, b -> isOrange(r, g, b) }
 
-                val redBars = isRedBars(
+                val (topRed, botRed) = redBandRatios(
                     buf, rowStride, w,
                     rect.left, rect.top, rect.right, rect.bottom
                 )
 
-                // Estado target según visión
-                val seenOrange = orangeRatio > 0.28f     // ajustable
-                val seenRedBars = redBars                // ya es boolean
+                val f = Features(orangeRatio, topRed, botRed)
+                lastFeatures[name] = f
 
-                // Lógica de estados
+                // Umbrales: entrenados si existen, si no default
+                val trained = trainingStore?.computeThresholds(name)
+                val orangeTh = trained?.orangeThreshold ?: 0.28f
+                val redTh = trained?.redThreshold ?: 0.22f
+
+                val seenOrange = orangeRatio > orangeTh
+                val seenRedBars = (topRed > redTh && botRed > redTh)
+
                 when {
+                    // OBSTÁCULO: naranja
                     seenOrange -> {
                         if (tr.state != State.ORANGE) {
                             tr.state = State.ORANGE
                             tr.redSinceMs = null
                             telegram?.send("🟠 TRANSFER $name PARADO (OBSTÁCULO)")
-                            throttledUi(now, "🟠 Transfer $name: OBSTÁCULO (alerta enviada)")
                         }
+                        throttledUi(
+                            now,
+                            "🟠 Transfer $name: OBSTÁCULO (orange=${fmt(orangeRatio)} th=${fmt(orangeTh)})"
+                        )
                     }
 
+                    // FALLO: barras rojas arriba/abajo
                     seenRedBars -> {
-                        // Si veníamos de ORANGE, cambiamos a RED_PENDING (fallo) igualmente
                         if (tr.redSinceMs == null) tr.redSinceMs = now
-
                         val elapsed = now - (tr.redSinceMs ?: now)
+
                         if (elapsed >= faultConfirmMs) {
                             if (tr.state != State.RED_CONFIRMED) {
                                 tr.state = State.RED_CONFIRMED
                                 telegram?.send("🟥 TRANSFER $name MAL FUNCIONAMIENTO (>15s)")
-                                throttledUi(now, "🟥 Transfer $name: MAL FUNCIONAMIENTO (enviado)")
                             }
+                            throttledUi(
+                                now,
+                                "🟥 Transfer $name: MAL FUNCIONAMIENTO (top=${fmt(topRed)} bot=${fmt(botRed)} th=${fmt(redTh)})"
+                            )
                         } else {
-                            if (tr.state != State.RED_PENDING) {
-                                tr.state = State.RED_PENDING
-                                throttledUi(now, "⚠️ Transfer $name: posible fallo (${((faultConfirmMs - elapsed)/1000)}s)")
-                            }
+                            if (tr.state != State.RED_PENDING) tr.state = State.RED_PENDING
+                            throttledUi(now, "⚠️ Transfer $name: posible fallo (${((faultConfirmMs - elapsed) / 1000)}s)")
                         }
                     }
 
+                    // OK
                     else -> {
-                        // Vuelve a OK
-                        if (tr.state == State.ORANGE) {
+                        if (tr.state == State.ORANGE || tr.state == State.RED_PENDING || tr.state == State.RED_CONFIRMED) {
                             telegram?.send("✅ TRANSFER $name REARMADO — TODO OK")
-                        } else if (tr.state == State.RED_CONFIRMED || tr.state == State.RED_PENDING) {
-                            telegram?.send("✅ TRANSFER $name ACTIVO — TODO OK")
                         }
                         tr.state = State.OK
                         tr.redSinceMs = null
@@ -120,20 +133,22 @@ class VigiaVisionAnalyzer(
         }
     }
 
+    private fun fmt(v: Float) = String.format("%.2f", v)
+
     private fun throttledUi(now: Long, msg: String) {
-        if (now - lastUiMs > 600) { // evita spam de UI
+        if (now - lastUiMs > 600) {
             lastUiMs = now
             onStatusText(msg)
         }
     }
 
-    // --- Detección por color (HSV) ---
+    // --- Color detectors ---
     private fun isOrange(r: Int, g: Int, b: Int): Boolean {
         val hsv = FloatArray(3)
         Color.RGBToHSV(r, g, b, hsv)
-        val h = hsv[0]      // 0..360
-        val s = hsv[1]      // 0..1
-        val v = hsv[2]      // 0..1
+        val h = hsv[0]
+        val s = hsv[1]
+        val v = hsv[2]
         return (h in 18f..50f) && s > 0.45f && v > 0.35f
     }
 
@@ -158,22 +173,20 @@ class VigiaVisionAnalyzer(
         return PxRect(min(l, r), min(t, b), max(l, r), max(t, b))
     }
 
-    // --- Red bars: rojo arriba y abajo dentro de ROI ---
-    private fun isRedBars(
+    // ratios de rojo en banda superior e inferior
+    private fun redBandRatios(
         buf: ByteBuffer,
         rowStride: Int,
         imgW: Int,
         l: Int, t: Int, r: Int, b: Int
-    ): Boolean {
+    ): Pair<Float, Float> {
         val height = b - t
-        if (height < 20) return false
+        if (height < 20) return 0f to 0f
 
-        val bandH = max(8, (height * 0.18f).toInt()) // 18% arriba/abajo
+        val bandH = max(8, (height * 0.18f).toInt())
         val topRed = sampleColorRatio(buf, rowStride, imgW, l, t, r, t + bandH, 7) { rr, gg, bb -> isRed(rr, gg, bb) }
         val botRed = sampleColorRatio(buf, rowStride, imgW, l, b - bandH, r, b, 7) { rr, gg, bb -> isRed(rr, gg, bb) }
-
-        // umbrales: barras bastante rojas
-        return topRed > 0.22f && botRed > 0.22f
+        return topRed to botRed
     }
 
     // --- Sampling sobre RGBA_8888 ---
@@ -191,7 +204,6 @@ class VigiaVisionAnalyzer(
         var hits = 0
         var total = 0
 
-        // Rejilla uniforme
         for (gy in 0 until grid) {
             val y = t + (gy * height) / (grid - 1).coerceAtLeast(1)
             val yy = y.coerceAtLeast(0)
@@ -199,17 +211,17 @@ class VigiaVisionAnalyzer(
                 val x = l + (gx * width) / (grid - 1).coerceAtLeast(1)
                 val xx = x.coerceAtLeast(0)
 
-                val idx = yy * rowStride + xx * 4 // RGBA
+                val idx = yy * rowStride + xx * 4
                 if (idx + 2 >= buf.limit()) continue
 
                 val rr = buf.get(idx).toInt() and 0xFF
                 val gg = buf.get(idx + 1).toInt() and 0xFF
                 val bb = buf.get(idx + 2).toInt() and 0xFF
+
                 total++
                 if (predicate(rr, gg, bb)) hits++
             }
         }
-        if (total == 0) return 0f
-        return hits.toFloat() / total.toFloat()
+        return if (total == 0) 0f else hits.toFloat() / total.toFloat()
     }
 }
